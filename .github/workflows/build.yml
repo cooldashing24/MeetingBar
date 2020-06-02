@@ -15,6 +15,7 @@ jobs:
     - name: Xcodebuild Action
       uses: sersoft-gmbh/xcodebuild-action@v1.1
       with:
-        project: MeetingBar
+        project: MeetingBar.xcodeproj
+        scheme: MeetingBar
         action: build
 
