@@ -20,7 +20,7 @@ struct TitleTruncationRules {
 struct LinksRegex {
     let meet = try! NSRegularExpression(pattern: #"https?://meet.google.com/[a-z-]+"#)
     let hangouts = try! NSRegularExpression(pattern: #"https?://hangouts.google.com/[^\s]*"#)
-    let zoom = try! NSRegularExpression(pattern: #"https?:\/\/(?:[a-zA-Z0-9-.]+)?zoom.(?:us|com.cn)\/(?:j|my)\/[0-9a-zA-Z?=.]*"#)
+    let zoom = try! NSRegularExpression(pattern: #"https?:\/\/(?:[a-zA-Z0-9-.]+)?zoom.(?:us|com.cn)\/(?:j|my|w)\/[^\s]*"#)
 
 
     /**
@@ -345,6 +345,9 @@ enum AppLanguage: String, Codable {
     case ukrainian = "ua"
     case russian = "ru"
     case croatian = "hr"
+    case german = "de"
+    case french = "fr"
+    case norwegian = "nb-NO"
 }
 
 struct Browser: Encodable, Decodable, Hashable {

@@ -125,6 +125,7 @@ class StatusBarItemControler: NSObject, NSMenuDelegate {
             case .none:
                 if Defaults[.joinEventNotification] {
                     removePendingNotificationRequests()
+                    removeDeliveredNotifications()
                 }
                 title = "🏁"
             case .nextEvent(let event):
@@ -156,7 +157,7 @@ class StatusBarItemControler: NSObject, NSMenuDelegate {
                 }
                 button.image?.size = NSSize(width: 16, height: 16)
             } else if title == "MeetingBar" {
-                button.image = NSImage(named: Defaults[.eventTitleIconFormat].rawValue)!
+                button.image = NSImage(named: "AppIcon")!
                 button.image?.size = NSSize(width: 16, height: 16)
             } else if case .afterThreshold = nextEventState {
                 switch Defaults[.eventTitleIconFormat] {
