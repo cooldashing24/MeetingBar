@@ -1,36 +1,64 @@
-
 # Contributing to MeetingBar
-We love your input! We want to make contributing to this project as easy and transparent as possible, whether it's:
 
-- Reporting a bug
-- Discussing the current state of the code
-- Submitting a fix
-- Proposing new features
-- Becoming a maintainer
+MeetingBar welcomes focused bug fixes, meeting-service integrations, reliability improvements, translations, and documentation updates.
 
-## We Develop with Github
-We use github to host code, to track issues and feature requests, as well as accept pull requests.
+## GitHub Workflow
 
-## Report bugs using Github's [issues](hhttps://github.com/leits/MeetingBar/issues)
-We use GitHub issues to track public bugs. Report a bug by [opening a new issue](https://github.com/leits/MeetingBar/issues/new); it's that easy!
+Use GitHub issues for public bugs and feature requests. Keep pull requests small enough to review in one pass, and describe:
 
-## Write bug reports with detail, background, and sample code
-**Great Bug Reports** tend to have:
+* What changed and why
+* User-visible behavior changes
+* Tests or validation commands you ran
+* Any dependency, entitlement, signing, URL scheme, script, workflow, or base-localization changes
 
-- A quick summary and/or background
-- Steps to reproduce
-  - Be specific!
-- What you expected would happen
-- What actually happens
-- Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
+## Bug Reports
 
-People *love* thorough bug reports. I'm not even kidding.
+Good bug reports include:
 
-## Building locally
-To build MeetingBar on your computer, you need to configure the project to use your own Apple-supplied development team. You can do this *without making changes to the Xcode project*, by creating the plain-text file `XCConfig/DevTeamOverride.xcconfig` containing the following:
+* MeetingBar version and macOS version
+* Calendar provider: macOS Calendar or Google Calendar
+* Meeting service when relevant: Zoom, Google Meet, Microsoft Teams, Webex, etc.
+* Steps to reproduce
+* Expected behavior and actual behavior
+* Whether manual refresh, relaunch, or reconnect changes the result
+* Sanitized event title, description, location, URL fields, screenshots, or logs when useful
+
+## Building Locally
+
+MeetingBar is a macOS app built with Xcode, Swift 6, AppKit, SwiftUI, and Xcode-managed Swift Package dependencies.
+
+For local signing, create `XCConfig/DevTeamOverride.xcconfig` with your Apple development team. This file is git-ignored, so you do not need to change the Xcode project:
+
+```xcconfig
+DEVELOPMENT_TEAM = <your development team id>
 ```
-DEVELOPMENT_TEAM = <your development team id here>"
+
+The same git-ignored override can also provide real `GOOGLE_CLIENT_NUMBER`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_AUTH_KEYCHAIN_NAME` values for local Google Calendar sign-in. Do not commit credentials. The checked-in `Project.xcconfig` values are placeholders for builds without configured Google OAuth.
+
+Xcode loads `Project-Debug.xcconfig` / `Project-Release.xcconfig` as the project's Base Configuration. Before compiling the app, the `Validate xcconfig` build phase fails if any Google OAuth build setting is missing, empty, or unresolved. Placeholder values are permitted for CI/build verification, but cannot authorize Google Calendar.
+
+Run `make test-config` to check the validator's success/failure cases.
+
+Common validation commands:
+
+```bash
+make build            # Debug build
+make test             # SwiftPM logic tests + Xcode app-hosted tests with coverage
+make test-logic       # Hostless SwiftPM logic tests only
+make lint             # SwiftLint
+make validate-strings # Verify English localization keys used by .loco()
 ```
+
+Unsigned local Debug builds may print entitlement or signing warnings because code signing is disabled. That warning is expected for local verification; signed Release builds still need a real signing check.
+
+## Architecture And Dependencies
+
+Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before changing app flow, calendar providers, meeting-link detection, notifications, status-bar rendering, settings, package dependencies, entitlements, or release-sensitive configuration.
+
+Direct app dependencies are Xcode Swift Package references pinned by `MeetingBar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`. `Package.swift` defines the hostless `MeetingBarLogic` package used for fast policy tests. Do not update only `Package.resolved`; change the Xcode package requirement intentionally and review the resolved diff. StoreKit is a system framework, not an external package dependency.
+
+Describe user-visible changes in the PR so the maintainer can prepare [GitHub Release notes](https://github.com/leits/MeetingBar/releases) when publishing. Do not update an in-repository changelog for each contribution. For changes significant enough to appear in the app's What's New screen, coordinate that separately with the maintainer. Refer to [`docs/TESTING.md`](docs/TESTING.md) for choosing the appropriate test layer. For new source strings, update `MeetingBar/Resources /Localization /en.lproj/Localizable.strings` and run `make validate-strings`; non-English translations are managed through Weblate.
 
 ## License
-By contributing, you agree that your contributions will be licensed under its Apache License 2.0.
+
+By contributing, you agree that your contributions are licensed under the Apache License 2.0.

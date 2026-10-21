@@ -1,0 +1,141 @@
+name: CI
+run-name: "CI · ${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || github.ref_name }} · ${{ github.event_name }}"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Replace older revisions of the same PR; keep master and manual runs independent.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select Xcode
+        run: |
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            echo "Expected Xcode not found at $DEVELOPER_DIR"
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+          sudo xcode-select -s "$DEVELOPER_DIR"
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build
+            build/SourcePackages
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'MeetingBar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Validate localizations
+        run: make validate-strings
+
+      - name: Run SwiftPM logic tests
+        run: make test-logic-quiet
+
+      # Export immediately: Xcode may replace SwiftPM build artifacts during the app build.
+      - name: Export SwiftPM coverage for Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        run: make coverage-codecov-logic
+
+      - name: Upload SwiftPM logic coverage to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: build/coverage/swiftpm.lcov
+          flags: swiftpm_logic
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Run app-hosted tests
+        id: app_tests
+        run: make test-app-quiet
+
+      - name: Publish results summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## App test results"
+            make test-summary
+            echo ""
+            echo "## Coverage"
+            echo '```'
+            make coverage-report 2>&1 || echo "coverage report unavailable"
+            make coverage-gate 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Slather
+        if: ${{ !cancelled() && steps.app_tests.outcome == 'success' && env.CODECOV_TOKEN != '' }}
+        run: gem install slather -v 2.8.5 --no-document
+
+      - name: Generate coverage report
+        if: ${{ !cancelled() && steps.app_tests.outcome == 'success' && env.CODECOV_TOKEN != '' }}
+        run: make coverage-codecov
+
+      - name: Upload app-hosted coverage to Codecov
+        if: ${{ !cancelled() && steps.app_tests.outcome == 'success' && env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: build/coverage/cobertura.xml
+          flags: app_hosted
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && hashFiles('build/test-results/*.xml') != '' && env.CODECOV_TOKEN != '' }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          directory: build/test-results
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Xcode result bundle
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: MeetingBar.xcresult
+          path: build/coverage/MeetingBar.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload SwiftPM coverage data
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swiftpm-coverage
+          path: .build/**/debug/codecov
+          if-no-files-found: ignore
+          # .build is a dotfile; upload-artifact skips hidden paths otherwise.
+          include-hidden-files: true
+          retention-days: 7

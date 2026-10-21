@@ -1,0 +1,324 @@
+//
+//  EKEventStore.swift
+//  MeetingBar
+//
+//  Created by Andrii Leitsius on 12.06.2020.
+//  Copyright © 2020 Andrii Leitsius. All rights reserved.
+//
+import Defaults
+import EventKit
+
+// Ref: https://stackoverflow.com/a/66074963
+extension EKParticipant {
+    var safeNSURL: NSURL? {
+        perform(#selector(getter: EKParticipant.url))?.takeUnretainedValue() as? NSURL
+    }
+}
+
+extension EKEventStore: @unchecked @retroactive Sendable {}
+
+// Reading a calendar requires full access; write-only access is insufficient.
+enum EventKitReadAccessError: LocalizedError, Equatable {
+    case notDetermined
+    case denied
+    case restricted
+    case writeOnly
+
+    static func current() -> Self? {
+        from(EKEventStore.authorizationStatus(for: .event))
+    }
+
+    static func from(_ status: EKAuthorizationStatus) -> Self? {
+        if #available(macOS 14, *) {
+            switch status {
+            case .fullAccess, .authorized: return nil
+            case .notDetermined: return .notDetermined
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .writeOnly: return .writeOnly
+            @unknown default: return .restricted
+            }
+        }
+
+        switch status {
+        case .authorized: return nil
+        case .notDetermined: return .notDetermined
+        case .denied: return .denied
+        case .restricted: return .restricted
+        default: return .restricted
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .notDetermined: return "MeetingBar needs permission to read calendars"
+        case .denied: return "Calendar access is denied. Enable MeetingBar in macOS Calendar privacy settings"
+        case .restricted: return "Calendar access is restricted by macOS"
+        case .writeOnly: return "MeetingBar needs full calendar access to read meetings"
+        }
+    }
+}
+
+extension EKEventStore: AuthenticatedEventStore {
+    nonisolated(unsafe) static var shared = EKEventStore()
+
+    public func signIn(forcePrompt: Bool = false) async throws {
+        try await withCheckedThrowingContinuation { cont in
+            let handler: @Sendable (Bool, (any Error)?) -> Void = { granted, error in
+                if granted {
+                    var sources = EKEventStore.shared.sources
+                    sources.append(contentsOf: EKEventStore.shared.delegateSources)
+
+                    EKEventStore.shared = EKEventStore(sources: sources)
+                    cont.resume()
+                } else if let accessError = EventKitReadAccessError.current() {
+                    cont.resume(throwing: accessError)
+                } else {
+                    cont.resume(throwing: error ?? NSError(domain: "EKEventStore", code: 0))
+                }
+            }
+
+            if #available(macOS 14, *) {
+                EKEventStore.shared.requestFullAccessToEvents(completion: handler)
+            } else {
+                EKEventStore.shared.requestAccess(to: .event, completion: handler)
+            }
+        }
+    }
+
+    public func signOut() async {}
+
+    public func refreshSources() async {
+        await Task.detached(priority: .userInitiated) {
+            EKEventStore.shared.refreshSourcesIfNecessary()
+        }.value
+    }
+
+    public func fetchAllCalendars() async throws -> [MBCalendar] {
+        if let accessError = EventKitReadAccessError.current() {
+            throw accessError
+        }
+        // Move enumeration off the main thread so a large source/calendar
+        // list does not hang the UI. EKEventStore is @unchecked Sendable
+        // (declared at the top of this file), so accessing `shared` from a
+        // detached task is safe. A future iteration can promote this into a
+        // dedicated actor that owns its own EKEventStore instance.
+        return await Task.detached(priority: .userInitiated) {
+            EKEventStore.shared.calendars(for: .event).map { ekCalendar in
+                MBCalendar(
+                    title: ekCalendar.title,
+                    id: ekCalendar.calendarIdentifier,
+                    source: ekCalendar.source.title,
+                    email: getGmailAccount(ekCalendar.source.description),
+                    color: ekCalendar.color
+                )
+            }
+        }.value
+    }
+
+    public func fetchEventsForDateRange(for calendars: [MBCalendar], from dateFrom: Date, to dateTo: Date) async throws -> [MBEvent] {
+        if let accessError = EventKitReadAccessError.current() {
+            throw accessError
+        }
+        // events(matching:) blocks while EventKit walks the store. For users
+        // with thousands of events this hung the menu bar. Push it off main.
+        return try await Task.detached(priority: .userInitiated) {
+            try fetchEventsOffMain(knownCalendars: calendars, dateFrom: dateFrom, dateTo: dateTo)
+        }.value
+    }
+}
+
+/// Selected EventKit calendars disappeared from the current system store.
+/// A successful empty fetch would otherwise erase the last known meetings.
+enum EventKitCalendarSelectionError: LocalizedError, Equatable {
+    case selectedCalendarsUnavailable
+
+    var errorDescription: String? {
+        "Previously selected macOS calendars are no longer available"
+    }
+}
+
+func requireAvailableEventKitSelection(
+    selectedIDs: [String],
+    availableIDs: [String]
+) throws {
+    guard !selectedIDs.isEmpty else { return }
+    // A partially missing selection is also incomplete calendar data, not a
+    // healthy snapshot that can safely replace the last known good meetings.
+    guard Set(selectedIDs).isSubset(of: Set(availableIDs)) else {
+        throw EventKitCalendarSelectionError.selectedCalendarsUnavailable
+    }
+}
+
+/// One EventKit occurrence as returned by the provider's query.
+/// Keeping the calendar identity alongside EKEvent makes query filtering and
+/// occurrence mapping testable without accessing a user's Calendar database.
+struct EventKitRawOccurrence {
+    let calendarID: String
+    let event: EKEvent
+}
+
+/// Calendar IDs are resolved again immediately before EventKit's query.
+/// Pass both resolution and occurrences through the same read seam so a
+/// disappearing calendar cannot be mistaken for a successful empty day.
+struct EventKitReadSnapshot {
+    let availableCalendarIDs: [String]
+    let occurrences: [EventKitRawOccurrence]
+}
+
+func mapEventKitRead(
+    knownCalendars: [MBCalendar],
+    dateFrom: Date,
+    dateTo: Date,
+    customRegexes: [String],
+    read: (_ ids: [String], _ from: Date, _ to: Date) throws -> EventKitReadSnapshot
+) throws -> [MBEvent] {
+    let byID = Dictionary(knownCalendars.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let calendarIDs = knownCalendars.map(\.id)
+    guard !calendarIDs.isEmpty else { return [] }
+
+    let snapshot = try read(calendarIDs, dateFrom, dateTo)
+    try requireAvailableEventKitSelection(
+        selectedIDs: calendarIDs,
+        availableIDs: snapshot.availableCalendarIDs
+    )
+    var events: [MBEvent] = []
+    for occurrence in snapshot.occurrences {
+        guard let calendar = byID[occurrence.calendarID] else {
+            MeetingBarLogger.calendar.warning(
+                "Skipping EventKit event from unknown calendar \(occurrence.calendarID, privacy: .private)"
+            )
+            continue
+        }
+        events.append(mbEvent(from: occurrence.event, calendar: calendar, customRegexes: customRegexes))
+    }
+    let deduplicated = Dictionary(events.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values
+    return Array(deduplicated)
+}
+
+private func fetchEventsOffMain(
+    knownCalendars: [MBCalendar],
+    dateFrom: Date,
+    dateTo: Date
+) throws -> [MBEvent] {
+    try mapEventKitRead(
+        knownCalendars: knownCalendars,
+        dateFrom: dateFrom,
+        dateTo: dateTo,
+        customRegexes: Defaults[.customRegexes]
+    ) { calendarIDs, from, to in
+        let selectedIDs = Set(calendarIDs)
+        let selectedCalendars = EKEventStore.shared.calendars(for: .event).filter {
+            selectedIDs.contains($0.calendarIdentifier)
+        }
+        // mapEventKitRead validates the second enumeration even if no events
+        // can be fetched. Never create a successful empty result in that case.
+        guard !selectedCalendars.isEmpty else {
+            return EventKitReadSnapshot(availableCalendarIDs: [], occurrences: [])
+        }
+        let predicate = EKEventStore.shared.predicateForEvents(
+            withStart: from, end: to, calendars: selectedCalendars
+        )
+        let occurrences = EKEventStore.shared.events(matching: predicate).map {
+            EventKitRawOccurrence(calendarID: $0.calendar.calendarIdentifier, event: $0)
+        }
+        return EventKitReadSnapshot(
+            availableCalendarIDs: selectedCalendars.map(\.calendarIdentifier),
+            occurrences: occurrences
+        )
+    }
+}
+
+func mbEvent(from rawEvent: EKEvent, calendar: MBCalendar, customRegexes: [String]) -> MBEvent {
+    var status: MBEventStatus
+    switch rawEvent.status {
+    case .confirmed:
+        status = .confirmed
+    case .tentative:
+        status = .tentative
+    case .canceled:
+        status = .canceled
+    default:
+        status = .none
+    }
+
+    let organizer = MBEventOrganizer(email: rawEvent.organizer?.url.absoluteString, name: rawEvent.organizer?.name)
+
+    var attendees: [MBEventAttendee] = []
+
+    for rawAttendee in rawEvent.attendees ?? [] {
+        if rawAttendee.participantType != .person {
+            continue
+        }
+        var attendeeStatus: MBEventAttendeeStatus
+        switch rawAttendee.participantStatus {
+        case .pending:
+            attendeeStatus = .pending
+        case .accepted:
+            attendeeStatus = .accepted
+        case .declined:
+            attendeeStatus = .declined
+        case .tentative:
+            attendeeStatus = .tentative
+        case .delegated:
+            attendeeStatus = .delegated
+        case .completed:
+            attendeeStatus = .completed
+        case .inProcess:
+            attendeeStatus = .inProcess
+        default:
+            attendeeStatus = .unknown
+        }
+
+        let optional = rawAttendee.participantRole == .optional
+        let email = rawAttendee.safeNSURL?.resourceSpecifier
+        let attendee = MBEventAttendee(email: email, name: rawAttendee.name, status: attendeeStatus, optional: optional, isCurrentUser: rawAttendee.isCurrentUser)
+
+        attendees.append(attendee)
+    }
+
+    // EventKit reuses calendarItemIdentifier for every occurrence of a
+    // recurring event, so suffix the start date to give each occurrence its
+    // own id — mirroring Google's per-instance event ids. True duplicates
+    // (same item, same start) still share an id, which keeps the id-keyed
+    // dedup collapsing them (34293d6) without eating recurring occurrences.
+    // The raw calendarItemIdentifier is still handed to meetingStart scripts
+    // via scriptIdentifier so existing user scripts keep their id format.
+    return MBEvent(
+        id: "\(rawEvent.calendarItemIdentifier):\(Int(rawEvent.startDate.timeIntervalSince1970))",
+        scriptIdentifier: rawEvent.calendarItemIdentifier,
+        lastModifiedDate: rawEvent.lastModifiedDate,
+        title: rawEvent.title,
+        status: status,
+        notes: rawEvent.notes,
+        location: rawEvent.location,
+        url: rawEvent.url,
+        calendarOpenURL: eventKitCalendarOpenURL(for: rawEvent.calendarItemIdentifier),
+        organizer: organizer,
+        attendees: attendees,
+        startDate: rawEvent.startDate,
+        endDate: rawEvent.endDate,
+        isAllDay: rawEvent.isAllDay,
+        recurrent: rawEvent.hasRecurrenceRules,
+        calendar: calendar,
+        customRegexes: customRegexes
+    )
+}
+
+func eventKitCalendarOpenURL(for identifier: String) -> URL? {
+    URL(string: "ical://ekevent/\(identifier)")
+}
+
+func getGmailAccount(_ text: String) -> String? {
+    // Hacky and likely to break, but should work until Apple changes something.
+    // Non-greedy quantifiers stop at the first closing quote, otherwise input
+    // with multiple mailto: occurrences captures everything between the first
+    // and last quote.
+    guard let regex = try? NSRegularExpression(pattern: #""mailto:([^"@]+@[^"]+)""#) else { return nil }
+    let range = NSRange(text.startIndex..., in: text)
+    guard let match = regex.firstMatch(in: text, range: range),
+          match.numberOfRanges > 1,
+          let captureRange = Range(match.range(at: 1), in: text)
+    else { return nil }
+    return String(text[captureRange])
+}

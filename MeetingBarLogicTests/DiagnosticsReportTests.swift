@@ -1,0 +1,194 @@
+//
+//  DiagnosticsReportTests.swift
+//  MeetingBarLogicTests
+//
+
+import XCTest
+
+@testable import MeetingBarLogic
+
+final class DiagnosticsReportTests: XCTestCase {
+    private let knownDate = Date(timeIntervalSince1970: 1_730_000_000)
+
+    private func context(
+        provider: DiagnosticsProvider = .macOSEventKit,
+        health: DiagnosticsHealth = DiagnosticsHealth()
+    ) -> DiagnosticsContext {
+        DiagnosticsContext(
+            appVersion: "4.12",
+            buildNumber: "999",
+            osVersion: "Version 14.5 (Build 23F79)",
+            provider: provider,
+            selectedCalendarCount: 3,
+            totalCalendarCount: 7,
+            visibleEventCount: 5,
+            health: health
+        )
+    }
+
+    func testReportHeaderIncludesVersionsAndProvider() {
+        let report = DiagnosticsReport.text(from: context())
+
+        XCTAssertTrue(report.contains("MeetingBar 4.12 (999)"))
+        XCTAssertTrue(report.contains("macOS: Version 14.5 (Build 23F79)"))
+        XCTAssertTrue(report.contains("Provider: Calendar.app (EventKit)"))
+    }
+
+    func testReportLabelsGoogleCalendarProvider() {
+        let report = DiagnosticsReport.text(from: context(provider: .googleCalendar))
+        XCTAssertTrue(report.contains("Provider: Google Calendar"))
+    }
+
+    func testReportShowsCalendarAndEventCounts() {
+        let report = DiagnosticsReport.text(from: context())
+        XCTAssertTrue(report.contains("Calendars: 3 selected / 7 available"))
+        XCTAssertTrue(report.contains("Visible events: 5"))
+    }
+
+    func testReportEmitsNeverWhenNoRefreshAttempted() {
+        let report = DiagnosticsReport.text(from: context(health: DiagnosticsHealth()))
+
+        XCTAssertTrue(report.contains("Provider health: initializing"))
+        XCTAssertTrue(report.contains("Stale data: no"))
+        XCTAssertTrue(report.contains("Auth required: no"))
+        XCTAssertTrue(report.contains("Last successful refresh: never"))
+        XCTAssertTrue(report.contains("Last attempted refresh: never"))
+        XCTAssertTrue(report.contains("Last error: none"))
+    }
+
+    func testReportFormatsDatesAsISO8601() {
+        let health = DiagnosticsHealth(
+            lastSuccessfulRefresh: knownDate,
+            lastAttemptedRefresh: knownDate,
+            lastErrorDescription: nil,
+            isStale: false
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        // ISO-8601 representation of 1_730_000_000 in UTC.
+        let formatter = ISO8601DateFormatter()
+        let expected = formatter.string(from: knownDate)
+        XCTAssertTrue(report.contains("Last successful refresh: \(expected)"))
+        XCTAssertTrue(report.contains("Last attempted refresh: \(expected)"))
+    }
+
+    func testReportShowsOKHealthWhenRefreshSucceeded() {
+        let health = DiagnosticsHealth(
+            lastSuccessfulRefresh: knownDate,
+            lastAttemptedRefresh: knownDate,
+            lastErrorDescription: nil,
+            isStale: false,
+            authRequired: false
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertTrue(report.contains("Provider health: ok"))
+        XCTAssertTrue(report.contains("Stale data: no"))
+        XCTAssertTrue(report.contains("Auth required: no"))
+    }
+
+    func testReportShowsErrorDescriptionWhenPresent() {
+        let health = DiagnosticsHealth(
+            lastSuccessfulRefresh: knownDate.addingTimeInterval(-3600),
+            lastAttemptedRefresh: knownDate,
+            lastErrorDescription: "The Internet connection appears to be offline.",
+            isStale: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+        XCTAssertTrue(report.contains("Provider health: error"))
+        XCTAssertTrue(report.contains("Stale data: yes"))
+        XCTAssertTrue(report.contains("Auth required: no"))
+        XCTAssertTrue(report.contains("Last error: The Internet connection appears to be offline."))
+    }
+
+    func testPublicDiagnosticsRedactsProviderURLsAndQueryCredentials() {
+        let health = DiagnosticsHealth(
+            lastErrorDescription: "Google Calendar HTTP 403 at https://www.googleapis.com/calendar/v3/calendars/private@example.com/events?access_token=topsecret",
+            isStale: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertTrue(report.contains("Google Calendar HTTP 403 at [URL redacted]"))
+        XCTAssertFalse(report.contains("private@example.com"))
+        XCTAssertFalse(report.contains("topsecret"))
+        XCTAssertFalse(report.contains("www.googleapis.com"))
+    }
+
+    func testPublicDiagnosticsRedactsGoogleForbiddenCalendarIdentifier() {
+        // Match the actual errorDescription from GoogleCalendarError.forbiddenCalendar.
+        let health = DiagnosticsHealth(
+            lastErrorDescription: "Google Calendar is not accessible: private@example.com",
+            isStale: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertTrue(report.contains(
+            "Last error: Google Calendar is not accessible: [calendar ID redacted]"
+        ))
+        XCTAssertFalse(report.contains("private@example.com"))
+        XCTAssertTrue(report.contains("Provider health: error"))
+    }
+
+    func testPublicDiagnosticsRedactsOpaqueGoogleCalendarIdentifier() {
+        let health = DiagnosticsHealth(
+            lastErrorDescription: "Google Calendar is not accessible: opaque-calendar-id-12345",
+            isStale: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertTrue(report.contains("[calendar ID redacted]"))
+        XCTAssertFalse(report.contains("opaque-calendar-id-12345"))
+    }
+
+    func testPublicDiagnosticsRedactsOtherOSURLSchemes() {
+        let health = DiagnosticsHealth(
+            lastErrorDescription: "Cannot open ical://ekevent/private-id or file:///Users/private/Library/Calendars",
+            isStale: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertFalse(report.contains("private-id"))
+        XCTAssertFalse(report.contains("/Users/private"))
+        XCTAssertTrue(report.contains("Cannot open [URL redacted]"))
+    }
+
+    func testReportShowsAuthRequiredState() {
+        let health = DiagnosticsHealth(
+            lastSuccessfulRefresh: knownDate.addingTimeInterval(-3600),
+            lastAttemptedRefresh: knownDate,
+            lastErrorDescription: "Google Calendar authorization is required",
+            isStale: true,
+            authRequired: true
+        )
+        let report = DiagnosticsReport.text(from: context(health: health))
+
+        XCTAssertTrue(report.contains("Provider health: auth required"))
+        XCTAssertTrue(report.contains("Stale data: yes"))
+        XCTAssertTrue(report.contains("Auth required: yes"))
+    }
+
+    func testReportDistinguishesWriteOnlyFromReadableCalendarPermission() {
+        let cases: [(PermissionSnapshot.CalendarAccess, String)] = [
+            (.authorized, "authorized"),
+            (.writeOnly, "write-only (cannot read events)"),
+            (.denied, "denied"),
+            (.restricted, "restricted"),
+            (.notDetermined, "not determined")
+        ]
+        for (access, label) in cases {
+            var input = context()
+            input.permissions = PermissionSnapshot(
+                calendarAccess: access,
+                notificationAccess: .authorized,
+                googleAuthStatus: .notActive,
+                scriptFileExists: false,
+                isAppStoreBuild: false
+            )
+            let report = DiagnosticsReport.text(from: input)
+            XCTAssertTrue(report.contains("Calendar permission: \(label)"))
+            if access == .writeOnly {
+                XCTAssertFalse(report.contains("Calendar permission: authorized"))
+            }
+        }
+    }
+}

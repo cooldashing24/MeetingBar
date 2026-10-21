@@ -1,0 +1,941 @@
+//
+//  MeetingLinkDetector.swift
+//  MeetingBar
+//
+//  Owns everything related to extracting a meeting URL from an event:
+//  the public `MeetingLink` value type, regex catalogue compiled from
+//  `MeetingProvider.all`, helper functions for cleaning Outlook SafeLinks
+//  and stripping HTML notes, the candidate ranking policy, and the
+//  detector that orchestrates them.
+//
+
+import AppKit
+import Foundation
+
+// MARK: - Public value types
+
+/// Catalogue of meeting service identifiers used as the primary key for
+/// detection regexes, icons, browser preferences, and bookmarks. Provider
+/// metadata (regex, icon, native-app browser) lives on `MeetingProvider.all`.
+enum MeetingServices: String, Codable, CaseIterable, Sendable {
+    case phone = "Phone"
+    case meet = "Google Meet"
+    case protonMeet = "Proton Meet"
+    case hangouts = "Google Hangouts"
+    case zoom = "Zoom"
+    case zoom_native = "Zoom native"
+    case teams = "Microsoft Teams"
+    case webex = "Cisco Webex"
+    case jitsi = "Jitsi"
+    case chime = "Amazon Chime"
+    case ringcentral = "Ring Central"
+    case gotomeeting = "GoToMeeting"
+    case gotowebinar = "GoToWebinar"
+    case bluejeans = "BlueJeans"
+    case eight_x_eight = "8x8"
+    case demio = "Demio"
+    case join_me = "Join.me"
+    case zoomgov = "ZoomGov"
+    case whereby = "Whereby"
+    case uberconference = "Uber Conference"
+    case blizz = "Blizz"
+    case teamviewer_meeting = "Teamviewer Meeting"
+    case vsee = "VSee"
+    case starleaf = "StarLeaf"
+    case duo = "Google Duo"
+    case voov = "Tencent VooV"
+    case facebook_workspace = "Facebook Workspace"
+    case lifesize = "Lifesize"
+    case skype = "Skype"
+    case skype4biz = "Skype For Business"
+    case skype4biz_selfhosted = "Skype For Business (SH)"
+    case facetime = "Facetime"
+    case pop = "Pop"
+    case chorus = "Chorus"
+    case gong = "Gong"
+    case livestorm = "Livestorm"
+    case facetimeaudio = "Facetime Audio"
+    case youtube = "YouTube"
+    case vonageMeetings = "Vonage Meetings"
+    case meetStream = "Google Meet Stream"
+    case around = "Around"
+    case jam = "Jam"
+    case discord = "Discord"
+    case blackboard_collab = "Blackboard Collaborate"
+    case url = "Any Link"
+    case coscreen = "CoScreen"
+    case vowel = "Vowel"
+    case zhumu = "Zhumu"
+    case lark = "Lark"
+    case feishu = "Feishu"
+    case vimeo = "Vimeo"
+    case ovice = "oVice"
+    case luma = "Luma"
+    case preply = "Preply"
+    case userzoom = "UserZoom"
+    case venue = "Venue"
+    case teemyco = "Teemyco"
+    case demodesk = "Demodesk"
+    case zoho_cliq = "Zoho Cliq"
+    case slack = "Slack"
+    case gather = "Gather"
+    case reclaim = "Reclaim.ai"
+    case tuple = "Tuple"
+    case pumble = "Pumble"
+    case suitConference = "Suit Conference"
+    case doxyMe = "Doxy.me"
+    case calcom = "Cal Video"
+    case zmPage = "zm.page"
+    case livekit = "LiveKit Meet"
+    case meetecho = "Meetecho"
+    case streamyard = "StreamYard"
+    case riverside = "Riverside"
+    case other = "Other"
+
+    /// Ranking tier used to break same-source ties between different services.
+    /// Known conferencing services (0) beat content links (1) such as YouTube
+    /// or Vimeo, which beat generic catch-alls like "Any Link"/"Other" (2). An
+    /// untagged (`nil`) service ranks below all of these at the call site.
+    var rankTier: Int {
+        switch self {
+        case .youtube, .vimeo: return 1
+        case .url, .other: return 2
+        default: return 0
+        }
+    }
+}
+
+public struct MeetingLink: Hashable, Equatable, Sendable {
+    let service: MeetingServices?
+    var url: URL
+}
+
+/// Where a meeting link candidate was extracted from. Higher-priority sources
+/// are preferred when more than one candidate is found for an event.
+enum MeetingLinkSource: Hashable, Sendable {
+    /// Structured conference data exposed by the provider — e.g. Google
+    /// Calendar's `conferenceData.entryPoints[type=video]`. Highest priority
+    /// because the provider has explicitly tagged this URL as the meeting.
+    case providerConferenceData
+
+    /// The event's explicit `url` field (EventKit `EKEvent.url`, Google
+    /// Calendar `event.hangoutLink` style fields surfaced as a URL).
+    case eventURL
+
+    /// The event's location field — sometimes hosts paste the meeting URL
+    /// here when there is no structured conference data.
+    case location
+
+    /// Free-text notes / description.
+    case notes
+
+    /// Notes field after HTML tag / entity stripping. Lower priority than
+    /// raw `notes` because stripping can occasionally normalise legitimate
+    /// links into a less canonical form.
+    case strippedHTMLNotes
+
+    /// User-provided regex match. Last-resort fallback so a custom regex
+    /// cannot override a real provider conference URL.
+    case customRegex
+
+    /// Numeric priority — larger wins. Gaps allow inserting new sources
+    /// later without renumbering existing ones.
+    var priority: Int {
+        switch self {
+        case .providerConferenceData: return 60
+        case .eventURL: return 50
+        case .location: return 40
+        case .notes: return 30
+        case .strippedHTMLNotes: return 20
+        case .customRegex: return 10
+        }
+    }
+}
+
+/// A single meeting-link candidate extracted from one source field of an event.
+struct MeetingLinkCandidate: Hashable, Sendable {
+    let url: URL
+    let service: MeetingServices?
+    let source: MeetingLinkSource
+    /// Character offset of the match within its source field's text. Breaks
+    /// same-tier ties in appearance order. Non-scan sources (provider
+    /// conference data, custom regex) use 0.
+    var matchLocation: Int = 0
+
+    // `matchLocation` is ranking metadata, not identity: exclude it from
+    // equality/hashing so candidate identity stays (url, service, source) and
+    // `MBEvent` equality doesn't shift when a link's position in the text moves.
+    static func == (lhs: MeetingLinkCandidate, rhs: MeetingLinkCandidate) -> Bool {
+        lhs.url == rhs.url && lhs.service == rhs.service && lhs.source == rhs.source
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(service)
+        hasher.combine(source)
+    }
+}
+
+enum MeetingLinkCandidatePolicy {
+    /// Picks the best candidate for an event:
+    ///
+    /// 1. by source priority — provider conference data beats notes;
+    /// 2. within the same source, a lower service tier wins — known
+    ///    conferencing links beat content links (YouTube, Vimeo), which beat
+    ///    generic catch-alls, which beat untagged links, so an incidental
+    ///    YouTube link in the notes cannot shadow the real Meet link;
+    /// 3. within the same tier, the service appearing earliest in the field
+    ///    wins, preserving the author's ordering between different services;
+    /// 4. within the same service, the longer URL wins so a Zoom link that
+    ///    carries a password/token suffix beats a truncated form of it.
+    ///
+    /// Position is compared per service group (a service's earliest match), so
+    /// the ordering stays a strict weak ordering: candidates of one service
+    /// cluster together and order among themselves by URL length, while
+    /// distinct services order by first appearance.
+    static func best(from candidates: [MeetingLinkCandidate]) -> MeetingLinkCandidate? {
+        let positions = serviceEarliestPositions(candidates)
+        return candidates.min { isRankedBefore($0, $1, servicePositions: positions) }
+    }
+
+    /// Returns candidates ranked best-to-worst, deduplicated by URL string.
+    /// Useful for a "open with another link" menu without re-running detection.
+    static func ranked(from candidates: [MeetingLinkCandidate]) -> [MeetingLinkCandidate] {
+        let deduped = Array(
+            Dictionary(grouping: candidates, by: { $0.url.absoluteString })
+                .compactMapValues { best(from: $0) }
+                .values
+        )
+        let positions = serviceEarliestPositions(deduped)
+        return deduped.sorted { isRankedBefore($0, $1, servicePositions: positions) }
+    }
+
+    /// Identifies a service within one source field, so a service's earliest
+    /// match position is computed per source (positions from different fields
+    /// are never comparable — source priority separates them first).
+    private struct ServiceGroupKey: Hashable {
+        let source: MeetingLinkSource
+        let service: MeetingServices?
+    }
+
+    /// Earliest `matchLocation` per (source, service) across `candidates`.
+    private static func serviceEarliestPositions(
+        _ candidates: [MeetingLinkCandidate]
+    ) -> [ServiceGroupKey: Int] {
+        var positions: [ServiceGroupKey: Int] = [:]
+        for candidate in candidates {
+            let key = ServiceGroupKey(source: candidate.source, service: candidate.service)
+            positions[key] = Swift.min(positions[key] ?? candidate.matchLocation, candidate.matchLocation)
+        }
+        return positions
+    }
+
+    /// True when `lhs` outranks `rhs`. A total lexicographic ordering over
+    /// (source priority, service tier, service group position, URL length, URL
+    /// string), satisfying the strict-weak-ordering contract `min`/`sorted`
+    /// require. Candidates with a `nil` service rank below every catalogued
+    /// conferencing, content, and generic service.
+    private static func isRankedBefore(
+        _ lhs: MeetingLinkCandidate,
+        _ rhs: MeetingLinkCandidate,
+        servicePositions: [ServiceGroupKey: Int]
+    ) -> Bool {
+        if lhs.source.priority != rhs.source.priority {
+            return lhs.source.priority > rhs.source.priority
+        }
+        let lhsTier = rankTier(of: lhs.service)
+        let rhsTier = rankTier(of: rhs.service)
+        if lhsTier != rhsTier {
+            return lhsTier < rhsTier
+        }
+        let lhsPos = groupPosition(of: lhs, in: servicePositions)
+        let rhsPos = groupPosition(of: rhs, in: servicePositions)
+        if lhsPos != rhsPos {
+            return lhsPos < rhsPos
+        }
+        let lhsLength = lhs.url.absoluteString.count
+        let rhsLength = rhs.url.absoluteString.count
+        if lhsLength != rhsLength {
+            return lhsLength > rhsLength
+        }
+        return lhs.url.absoluteString < rhs.url.absoluteString
+    }
+
+    private static func groupPosition(
+        of candidate: MeetingLinkCandidate,
+        in servicePositions: [ServiceGroupKey: Int]
+    ) -> Int {
+        let key = ServiceGroupKey(source: candidate.source, service: candidate.service)
+        return servicePositions[key] ?? candidate.matchLocation
+    }
+
+    /// Untagged (`nil`) services rank below the generic tier; otherwise the
+    /// service's own tier.
+    private static func rankTier(of service: MeetingServices?) -> Int {
+        service?.rankTier ?? 3
+    }
+}
+
+// MARK: - Regex catalogue and text helpers
+
+private let meetingLinkRegexes: [MeetingServices: NSRegularExpression] =
+    MeetingProvider.regexPatterns.compactMapValues { pattern in
+        do {
+            return try NSRegularExpression(pattern: pattern)
+        } catch {
+            assertionFailure("Invalid built-in meeting link regex: \(pattern)")
+            return nil
+        }
+    }
+
+private let outlookSafeLinkRegex = try? NSRegularExpression(
+    // Only the encoded `url` value belongs to the target. Parameters after it
+    // (including HTML-escaped separators) belong to SafeLinks, not the meeting.
+    pattern: #"https://[^\s/?#"'<>]+\.safelinks\.protection\.outlook\.com/[^\s"'<>]*?[?&](?:amp;)?url=([^\s&"'<>]+)"#
+        + #"(?:&(?:amp;)?[A-Za-z][A-Za-z0-9_]*=[^\s&"'<>]*)*"#)
+
+/// Matches Google's `google.<tld>/url?q=<percent-encoded target>` redirect
+/// together with the tracking parameters Google appends after it, whether they
+/// arrive as `&` or as the HTML entity `&amp;`.
+///
+/// The capture group is the encoded target only, which ends at the first `&`.
+/// Because the target is *fully* percent-encoded, every `&` after `q=` belongs
+/// to Google rather than to the target — so the pattern consumes any trailing
+/// `name=value` pair rather than an allow-list of known ones. An unrecognised
+/// parameter would otherwise be left glued onto the unwrapped URL, which both
+/// defeats the string-identity dedupe in `MeetingLinkCandidatePolicy.ranked`
+/// and changes the URL any downstream exact comparison sees.
+///
+/// The host is matched across country domains (`google.de`, `google.co.uk`),
+/// with or without `www.`, because Calendar renders the redirect under the
+/// viewer's Google domain. It stays `https`-only and requires `q` to be the
+/// first parameter, which is what Calendar emits;
+/// `testHostAndSchemeBoundariesAreNotRewritten` records those boundaries.
+private let googleRedirectRegex = try? NSRegularExpression(
+    pattern: #"https://(?:www\.)?google\.[a-z]{2,}(?:\.[a-z]{2,})?/url\?q=([^\s&"'<>]+)"#
+        + #"(?:&(?:amp;)?[A-Za-z][A-Za-z0-9_]*=[^\s&"'<>]*)*"#)
+
+/// Matches Clari Copilot's Google Meet wrapper,
+/// `go.copilot.clari.com/hangout/<meet code>`, where the slug is the
+/// meeting's own Meet code. Only the exact `xxx-xxxx-xxx` shape matches,
+/// and the wrapper must end there (bar an optional trailing slash): any
+/// continuation outside a query, fragment or text delimiter blocks the rewrite,
+/// so a longer slug or a deeper path is never partially rewritten into a
+/// link for the wrong meeting. Other Clari paths — e.g. Zoom wrappers,
+/// which carry no reconstructible target — are left untouched.
+private let clariCopilotRegex = try? NSRegularExpression(
+    pattern: #"https?://go\.copilot\.clari\.com/hangout/([a-z]{3}-[a-z]{4}-[a-z]{3})/?(?=$|[?#\s\"'<>])"#)
+
+func regex(for service: MeetingServices) -> NSRegularExpression? {
+    meetingLinkRegexes[service]
+}
+
+func detectMeetingLink(_ rawText: String, customRegexes: [String] = []) -> MeetingLink? {
+    let text = cleanupMeetingRedirects(rawText: rawText)
+
+    for pattern in customRegexes {
+        if let regex = try? NSRegularExpression(pattern: pattern),
+            let link = getMatch(text: text, regex: regex),
+            let url = URL(string: link) {
+            return MeetingLink(service: MeetingServices.other, url: url)
+        }
+    }
+
+    if text.contains("://") {
+        for (svc, regex) in meetingLinkRegexes {
+            if let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                let range = Range(match.range, in: text),
+                let url = URL(string: String(text[range])) {
+                return MeetingLink(service: svc, url: url)
+            }
+        }
+    }
+    return nil
+}
+
+/// Rewrites Outlook SafeLink wrappers in `rawText` back to their real
+/// targets, so meeting-link detection sees the underlying URL rather than the
+/// `…safelinks.protection.outlook.com/…url=<encoded>` redirect.
+/// Uses the same bounded, per-match rewriting as Google redirects.
+func cleanupOutlookSafeLinks(rawText: String) -> String {
+    guard let outlookSafeLinkRegex else { return rawText }
+    return unwrappingRedirects(in: rawText, using: [outlookSafeLinkRegex])
+}
+
+/// Rewrites Google Calendar's `google.<tld>/url?q=…` redirects in `rawText`
+/// back to their real targets, so detection sees the underlying meeting URL.
+///
+/// When Calendar renders an invite body it wraps links in this redirect with
+/// the target percent-encoded, so `?pwd=X` becomes `?pwd%3DX`. For a link the
+/// organiser typed into the body, Calendar emits both forms — plain and
+/// wrapped — and the wrapped one is *longer*, so it wins
+/// `MeetingLinkCandidatePolicy`'s length tie-break. Its `pwd` is then not a
+/// query parameter at all but part of one valueless parameter name, so no
+/// passcode reaches Zoom and the client prompts for one the invite supplied.
+/// Links Calendar generates itself, such as the add-on's "Joining
+/// instructions", appear wrapped only; those never had a plain form to lose to.
+///
+/// Every match is rewritten in a single pass, so `maxNestingDepth` bounds
+/// *nesting depth* — a redirect whose target is itself a redirect — rather than
+/// how many links a body may contain. An earlier version rewrote one match per pass,
+/// which silently left the tail of a link-heavy invite wrapped.
+///
+/// An undecodable `%` escape skips that match and leaves it as-is; it must not
+/// abort the pass, or one malformed link anywhere earlier in the body would
+/// reinstate the bug for the meeting link after it.
+func cleanupGoogleRedirects(rawText: String) -> String {
+    guard let googleRedirectRegex else { return rawText }
+    return unwrappingRedirects(in: rawText, using: [googleRedirectRegex])
+}
+
+/// Detection must unwrap both kinds to a fixed point: a Google redirect can
+/// contain a SafeLink (and vice versa), including several alternating layers.
+func cleanupMeetingRedirects(rawText: String) -> String {
+    cleanupClariCopilotLinks(rawText: unwrappingRedirects(
+        in: rawText,
+        using: [outlookSafeLinkRegex, googleRedirectRegex].compactMap { $0 }
+    ))
+}
+
+/// Bounds nesting work, not link count: each regex rewrites every decodable
+/// match in a pass. Malformed matches are preserved without blocking later
+/// matches. Stop when no rewrite makes progress, with a hard cap as a backstop.
+private func unwrappingRedirects(in rawText: String, using regexes: [NSRegularExpression]) -> String {
+    var text = rawText
+    autoreleasepool {
+        let maxNestingDepth = 32
+        for _ in 0 ..< maxNestingDepth {
+            let previous = text
+            for regex in regexes {
+                if let rewritten = rewritingRedirects(in: text, using: regex) {
+                    text = rewritten
+                }
+            }
+            guard text != previous else { break }
+        }
+    }
+    return text
+}
+
+/// One rewrite pass: splices every decodable redirect in `text` with its
+/// decoded target, returning nil when nothing changed.
+///
+/// Builds the result by appending segments rather than mutating in place —
+/// `String.Index` values from the match list are only valid against the string
+/// they were computed from, and a global `replacingOccurrences` of the matched
+/// text would rewrite inside a longer wrapper that happens to start with it.
+private func rewritingRedirects(
+    in text: String,
+    using regex: NSRegularExpression
+) -> String? {
+    let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+    guard !matches.isEmpty else { return nil }
+
+    var result = ""
+    var copiedUpTo = text.startIndex
+    var didRewrite = false
+
+    for match in matches {
+        guard let fullRange = Range(match.range, in: text),
+              let targetRange = Range(match.range(at: 1), in: text),
+              // Upholds the slicing invariant below rather than guarding a
+              // diagnosed case: `matches` is non-overlapping and ascending, so
+              // this holds today. If that ever stopped being true the slice
+              // `text[copiedUpTo ..< fullRange.lowerBound]` would trap.
+              fullRange.lowerBound >= copiedUpTo
+        else { continue }
+
+        // Skip, don't abort: a malformed escape here must not strand the
+        // redirects after it.
+        guard let decodedTarget = String(text[targetRange]).removingPercentEncoding
+        else { continue }
+
+        result += text[copiedUpTo ..< fullRange.lowerBound]
+        result += decodedTarget
+        copiedUpTo = fullRange.upperBound
+        didRewrite = true
+    }
+
+    guard didRewrite else { return nil }
+    result += text[copiedUpTo...]
+    return result == text ? nil : result
+}
+
+/// Rewrites Clari Copilot notetaker wrappers in `rawText` to the
+/// `https://meet.google.com/<code>` link they stand for, so the event gets
+/// the regular Google Meet treatment (icon, opening modes, authuser).
+///
+/// Unlike the SafeLink and redirect cleanups a single pass is enough: the
+/// target is built from the matched code, not decoded from the text, so
+/// there is no nesting to chase and no failure mode that stalls progress.
+func cleanupClariCopilotLinks(rawText: String) -> String {
+    guard let clariCopilotRegex, rawText.contains("go.copilot.clari.com") else {
+        return rawText
+    }
+    return clariCopilotRegex.stringByReplacingMatches(
+        in: rawText,
+        range: NSRange(rawText.startIndex..., in: rawText),
+        withTemplate: "https://meet.google.com/$1"
+    )
+}
+
+func getMatch(text: String, regex: NSRegularExpression) -> String? {
+    var match: String?
+
+    autoreleasepool {
+        let resultsIterator = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+        let resultsMap = resultsIterator.compactMap { result -> String? in
+            guard let range = Range(result.range, in: text) else { return nil }
+            return String(text[range])
+        }
+
+        if !resultsMap.isEmpty {
+            match = resultsMap[0]
+        }
+    }
+
+    return match
+}
+
+/// Converts an HTML notes fragment to plain text.
+///
+/// Deliberately avoids `NSAttributedString(html:)`: that initializer spins up
+/// TextKit's `com.apple.textkit.nsattributedstringagent` XPC service and leaks
+/// ~2 mach ports per call that are never reclaimed. Meeting-link detection runs
+/// this for every event with HTML notes on every calendar refresh, so over a
+/// day of refreshes the process port table fills and the kernel kills the app
+/// with EXC_GUARD ("allocating too many mach ports"). `HTMLPlainText` is a
+/// pure-Foundation strip with no XPC.
+func htmlTagsStrippedForMeetingLinks(_ text: String) -> String {
+    guard text.containsHTMLTags else { return text }
+    return HTMLPlainText.from(text)
+}
+
+extension String {
+    fileprivate var containsHTMLTags: Bool {
+        range(of: #"</?[A-z][ \t\S]*>"#, options: .regularExpression) != nil
+    }
+}
+
+/// Pure-Foundation HTML→plain-text conversion (no TextKit / XPC). Maps
+/// block-level tags to newlines, removes every other tag, and decodes HTML
+/// entities: any numeric entity (decimal `&#123;` or hex `&#x7B;`), plus the
+/// named entities below — the five XML predefined names, common typographic
+/// symbols, and the full Latin-1 accented-letter set (café, München, …). Named
+/// entities outside this table are left as written; numeric coverage is total.
+enum HTMLPlainText {
+    private static let scriptStyleRegex = makeRegex(#"(?is)<(script|style)\b[^>]*>.*?</\1>"#)
+    private static let blockTagRegex =
+        makeRegex(#"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h[1-6]>|</blockquote>"#)
+    private static let anyTagRegex = makeRegex("<[^>]+>")
+    private static let trailingSpaceRegex = makeRegex(#"[ \t]+\n"#)
+    private static let blankLinesRegex = makeRegex(#"\n{3,}"#)
+
+    static func from(_ html: String) -> String {
+        // Drop <script>/<style> elements entirely (tag *and* body); stripping
+        // only the tags would leak their CSS/JS text into the output.
+        var text = replacingMatches(scriptStyleRegex, in: html, with: "")
+        // Block-level boundaries become newlines so notes keep their structure.
+        text = replacingMatches(blockTagRegex, in: text, with: "\n")
+        text = replacingMatches(anyTagRegex, in: text, with: "")
+        text = decodeEntities(in: text)
+        text = replacingMatches(trailingSpaceRegex, in: text, with: "\n")
+        text = replacingMatches(blankLinesRegex, in: text, with: "\n\n")
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Patterns are compile-time constants (a bad one is a programmer error), so
+    /// compile once at first use and reuse — `from(_:)` runs per event on every
+    /// calendar refresh, and recompiling each call was pure overhead.
+    private static func makeRegex(_ pattern: String) -> NSRegularExpression {
+        try! NSRegularExpression(pattern: pattern)
+    }
+
+    private static func replacingMatches(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: template)
+    }
+
+    private static func decodeEntities(in text: String) -> String {
+        guard text.contains("&") else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            guard text[cursor] == "&" else {
+                result.append(text[cursor])
+                cursor = text.index(after: cursor)
+                continue
+            }
+            // Bound the `;` search to a short window (`&` + up to 12 chars) so
+            // pathological input with many stray `&` stays linear, not quadratic.
+            let windowEnd = text.index(cursor, offsetBy: 13, limitedBy: text.endIndex)
+                ?? text.endIndex
+            let afterAmp = text.index(after: cursor)
+            guard let semicolon = text[afterAmp..<windowEnd].firstIndex(of: ";"),
+                  let decoded = decode(entity: text[afterAmp..<semicolon])
+            else {
+                result.append(text[cursor])
+                cursor = afterAmp
+                continue
+            }
+            result.append(decoded)
+            cursor = text.index(after: semicolon)
+        }
+        return result
+    }
+
+    private static func decode(entity: Substring) -> Character? {
+        if entity.first == "#" {
+            let digits = entity.dropFirst()
+            let value: UInt32?
+            if let marker = digits.first, marker == "x" || marker == "X" {
+                value = UInt32(digits.dropFirst(), radix: 16)
+            } else {
+                value = UInt32(digits, radix: 10)
+            }
+            guard let value, let scalar = Unicode.Scalar(value) else { return nil }
+            return Character(scalar)
+        }
+        return namedEntities[String(entity)]
+    }
+
+    private static let namedEntities: [String: Character] = [
+        // XML predefined + structural
+        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
+        // Typographic symbols
+        "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",
+        "mdash": "\u{2014}", "ndash": "\u{2013}", "hellip": "\u{2026}",
+        "lsquo": "\u{2018}", "rsquo": "\u{2019}", "ldquo": "\u{201C}",
+        "rdquo": "\u{201D}", "middot": "\u{00B7}", "bull": "\u{2022}",
+        "euro": "\u{20AC}", "pound": "\u{00A3}", "cent": "\u{00A2}",
+        "yen": "\u{00A5}", "sect": "\u{00A7}", "para": "\u{00B6}",
+        "deg": "\u{00B0}", "plusmn": "\u{00B1}", "times": "\u{00D7}",
+        "divide": "\u{00F7}", "micro": "\u{00B5}", "laquo": "\u{00AB}",
+        "raquo": "\u{00BB}", "iexcl": "\u{00A1}", "iquest": "\u{00BF}",
+        "frac12": "\u{00BD}", "frac14": "\u{00BC}", "frac34": "\u{00BE}",
+        "ordm": "\u{00BA}", "ordf": "\u{00AA}", "sup1": "\u{00B9}",
+        "sup2": "\u{00B2}", "sup3": "\u{00B3}",
+        // Latin-1 accented letters (uppercase)
+        "Agrave": "\u{00C0}", "Aacute": "\u{00C1}", "Acirc": "\u{00C2}",
+        "Atilde": "\u{00C3}", "Auml": "\u{00C4}", "Aring": "\u{00C5}",
+        "AElig": "\u{00C6}", "Ccedil": "\u{00C7}", "Egrave": "\u{00C8}",
+        "Eacute": "\u{00C9}", "Ecirc": "\u{00CA}", "Euml": "\u{00CB}",
+        "Igrave": "\u{00CC}", "Iacute": "\u{00CD}", "Icirc": "\u{00CE}",
+        "Iuml": "\u{00CF}", "ETH": "\u{00D0}", "Ntilde": "\u{00D1}",
+        "Ograve": "\u{00D2}", "Oacute": "\u{00D3}", "Ocirc": "\u{00D4}",
+        "Otilde": "\u{00D5}", "Ouml": "\u{00D6}", "Oslash": "\u{00D8}",
+        "Ugrave": "\u{00D9}", "Uacute": "\u{00DA}", "Ucirc": "\u{00DB}",
+        "Uuml": "\u{00DC}", "Yacute": "\u{00DD}", "THORN": "\u{00DE}",
+        "szlig": "\u{00DF}",
+        // Latin-1 accented letters (lowercase)
+        "agrave": "\u{00E0}", "aacute": "\u{00E1}", "acirc": "\u{00E2}",
+        "atilde": "\u{00E3}", "auml": "\u{00E4}", "aring": "\u{00E5}",
+        "aelig": "\u{00E6}", "ccedil": "\u{00E7}", "egrave": "\u{00E8}",
+        "eacute": "\u{00E9}", "ecirc": "\u{00EA}", "euml": "\u{00EB}",
+        "igrave": "\u{00EC}", "iacute": "\u{00ED}", "icirc": "\u{00EE}",
+        "iuml": "\u{00EF}", "eth": "\u{00F0}", "ntilde": "\u{00F1}",
+        "ograve": "\u{00F2}", "oacute": "\u{00F3}", "ocirc": "\u{00F4}",
+        "otilde": "\u{00F5}", "ouml": "\u{00F6}", "oslash": "\u{00F8}",
+        "ugrave": "\u{00F9}", "uacute": "\u{00FA}", "ucirc": "\u{00FB}",
+        "uuml": "\u{00FC}", "yacute": "\u{00FD}", "thorn": "\u{00FE}",
+        "yuml": "\u{00FF}"
+    ]
+}
+
+// MARK: - Detector
+
+/// Picks the best meeting link from an event's available fields.
+///
+/// Each available field becomes a `MeetingLinkCandidate` tagged with its
+/// `MeetingLinkSource`. Candidates are then ranked by source priority and,
+/// within the same source, by service tier (conferencing beats content beats
+/// generic), then URL length for same-service links so a Zoom URL with a
+/// password/token suffix beats a truncated form, and finally the order the
+/// links appear in the field.
+///
+/// Source order (highest priority first):
+///
+/// 1. `providerConferenceData` — `conferenceURL` is the structured field set
+///    by the provider (Google `conferenceData.entryPoints[type=video]`);
+/// 2. `eventURL` — the event's plain URL field;
+/// 3. `location` — event location text;
+/// 4. `notes` — event notes / description text;
+/// 5. `strippedHTMLNotes` — notes after HTML tag/entity stripping;
+/// 6. `customRegex` — user-provided fallback patterns over the combined
+///    text fields.
+///
+/// Google Meet URLs are post-processed with an `authuser` query parameter
+/// when an account email is available.
+enum MeetingLinkDetector {
+    static func detect(
+        conferenceURL: URL? = nil,
+        location: String?,
+        eventURL: URL?,
+        notes: String?,
+        calendarEmail: String?,
+        currentUserEmail: String?,
+        customRegexes: [String] = []
+    ) -> MeetingLink? {
+        guard let best = bestCandidate(
+            conferenceURL: conferenceURL,
+            location: location,
+            eventURL: eventURL,
+            notes: notes,
+            calendarEmail: calendarEmail,
+            currentUserEmail: currentUserEmail,
+            customRegexes: customRegexes
+        ) else { return nil }
+        return MeetingLink(service: best.service, url: best.url)
+    }
+
+    static func bestCandidate(
+        conferenceURL: URL? = nil,
+        location: String?,
+        eventURL: URL?,
+        notes: String?,
+        calendarEmail: String?,
+        currentUserEmail: String?,
+        customRegexes: [String] = []
+    ) -> MeetingLinkCandidate? {
+        allCandidates(
+            conferenceURL: conferenceURL,
+            location: location,
+            eventURL: eventURL,
+            notes: notes,
+            calendarEmail: calendarEmail,
+            currentUserEmail: currentUserEmail,
+            customRegexes: customRegexes
+        ).first
+    }
+
+    static func allCandidates(
+        conferenceURL: URL? = nil,
+        location: String?,
+        eventURL: URL?,
+        notes: String?,
+        calendarEmail: String?,
+        currentUserEmail: String?,
+        customRegexes: [String] = []
+    ) -> [MeetingLinkCandidate] {
+        let candidates = collectCandidates(
+            conferenceURL: conferenceURL,
+            location: location,
+            eventURL: eventURL,
+            notes: notes,
+            customRegexes: customRegexes
+        )
+        return MeetingLinkCandidatePolicy.ranked(from: candidates)
+            .map {
+                applyMeetAuthuserIfNeeded(
+                    candidate: $0,
+                    calendarEmail: calendarEmail,
+                    currentUserEmail: currentUserEmail
+                )
+            }
+    }
+
+    private static func collectCandidates(
+        conferenceURL: URL?,
+        location: String?,
+        eventURL: URL?,
+        notes: String?,
+        customRegexes: [String]
+    ) -> [MeetingLinkCandidate] {
+        var candidates: [MeetingLinkCandidate] = []
+
+        // 1. Provider conference data.
+        if let conferenceURL {
+            let url = URL(string: cleanupMeetingRedirects(rawText: conferenceURL.absoluteString))
+                ?? conferenceURL
+            // Run through the regex catalog so we know whether it's Google Meet,
+            // Zoom, etc. If it doesn't match any built-in service, classify as
+            // `.other` so it still scores at the providerConferenceData priority.
+            let service = detectMeetingLink(url.absoluteString)?.service ?? .other
+            candidates.append(MeetingLinkCandidate(
+                url: url,
+                service: service,
+                source: .providerConferenceData
+            ))
+        }
+
+        // 2. Event URL.
+        if let eventURL {
+            candidates.append(contentsOf: builtInCandidates(
+                in: eventURL.absoluteString,
+                source: .eventURL
+            ))
+        }
+
+        // 3. Location.
+        if let location {
+            candidates.append(contentsOf: builtInCandidates(
+                in: location,
+                source: .location
+            ))
+        }
+
+        if let notes {
+            // 4. Raw notes.
+            candidates.append(contentsOf: builtInCandidates(
+                in: notes,
+                source: .notes
+            ))
+
+            // 5. Notes after HTML tag/entity stripping. Only contributes when
+            //    stripping changes the text — otherwise it would duplicate the
+            //    notes candidate.
+            let stripped = htmlTagsStrippedForMeetingLinks(notes)
+            if stripped != notes {
+                candidates.append(contentsOf: builtInCandidates(
+                    in: stripped,
+                    source: .strippedHTMLNotes
+                ))
+            }
+        }
+
+        // 6. Custom regex fallback over combined text. Lowest priority so a
+        //    custom regex cannot override a real provider conference URL.
+        if !customRegexes.isEmpty {
+            // Same cleanups as `builtInCandidates`. Without them a custom regex
+            // — used precisely for hosts the built-in catalogue does not know —
+            // matches the wrapped redirect and yields a URL whose `pwd` cannot
+            // be parsed. That candidate is also what the "open with another
+            // link" menu and the preferences regex tester display.
+            let combined = cleanupMeetingRedirects(
+                rawText: [location, eventURL?.absoluteString, notes]
+                    .compactMap { $0 }
+                    .joined(separator: "\n")
+            )
+            if let detected = detectCustomRegexLink(text: combined, patterns: customRegexes) {
+                candidates.append(MeetingLinkCandidate(
+                    url: detected.url,
+                    service: detected.service,
+                    source: .customRegex
+                ))
+            }
+        }
+
+        return candidates
+    }
+
+    private static func builtInCandidates(
+        in rawText: String,
+        source: MeetingLinkSource
+    ) -> [MeetingLinkCandidate] {
+        let text = cleanupMeetingRedirects(rawText: rawText)
+        guard text.contains("://") else { return [] }
+
+        let range = NSRange(text.startIndex..., in: text)
+        return MeetingServices.allCases.flatMap { service -> [MeetingLinkCandidate] in
+            guard let regex = regex(for: service) else { return [] }
+            return regex.matches(in: text, range: range).compactMap { match in
+                guard let matchRange = Range(match.range, in: text),
+                      let url = URL(string: String(text[matchRange]))
+                else { return nil }
+                return MeetingLinkCandidate(
+                    url: url,
+                    service: service,
+                    source: source,
+                    matchLocation: match.range.location
+                )
+            }
+        }
+    }
+
+    private static func detectCustomRegexLink(text: String, patterns: [String]) -> MeetingLink? {
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = regex.firstMatch(in: text, range: range),
+               let matchRange = Range(match.range, in: text),
+               let url = URL(string: String(text[matchRange])) {
+                return MeetingLink(service: .other, url: url)
+            }
+        }
+        return nil
+    }
+
+    private static func applyMeetAuthuserIfNeeded(
+        candidate: MeetingLinkCandidate,
+        calendarEmail: String?,
+        currentUserEmail: String?
+    ) -> MeetingLinkCandidate {
+        guard candidate.service == .meet,
+              let rawAccount = currentUserEmail ?? calendarEmail,
+              let urlWithAuth = url(candidate.url, appendingAuthuser: canonicalMeetAuthuser(from: rawAccount))
+        else { return candidate }
+        return MeetingLinkCandidate(
+            url: urlWithAuth,
+            service: candidate.service,
+            source: candidate.source,
+            matchLocation: candidate.matchLocation
+        )
+    }
+
+    /// Personal Gmail plus-addresses are delivery aliases, not separate sign-in
+    /// accounts. Preserve other domains: an address alone cannot establish
+    /// whether a custom domain uses Google Workspace or supports these aliases.
+    private static func canonicalMeetAuthuser(from email: String) -> String {
+        guard let atIndex = email.firstIndex(of: "@") else { return email }
+        let domain = email[email.index(after: atIndex)...].lowercased()
+        guard domain == "gmail.com" || domain == "googlemail.com" else { return email }
+
+        let localPart = email[..<atIndex]
+        guard let plusIndex = localPart.firstIndex(of: "+"),
+              plusIndex > email.startIndex,
+              email.index(after: plusIndex) < atIndex
+        else { return email }
+        // Keep dots, capitalization and the original domain spelling intact.
+        return String(email[..<plusIndex]) + String(email[atIndex...])
+    }
+
+    private static func url(_ url: URL, appendingAuthuser authAccount: String) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name == "authuser" }
+        queryItems.append(URLQueryItem(name: "authuser", value: authAccount))
+        components.queryItems = queryItems
+        return components.url
+    }
+}
+
+// MARK: - Opening policy
+
+/// Pure decision: given an event with optional meeting link and event URL,
+/// what should we do when the user clicks "join"? Side effects (running the
+/// script, calling NSWorkspace.open) are performed by `MeetingOpener`.
+struct MeetingOpeningEvent: Equatable {
+    let title: String
+    let meetingLink: MeetingLink?
+    let eventURL: URL?
+}
+
+enum MeetingOpeningAction: Equatable {
+    case openMeetingLink(MeetingLink, runJoinScript: Bool)
+    case openEventURL(URL)
+    case notifyMissingLink(title: String)
+}
+
+enum MeetingOpeningPolicy {
+    static func action(
+        for event: MeetingOpeningEvent,
+        runJoinEventScript: Bool
+    ) -> MeetingOpeningAction {
+        if let meetingLink = event.meetingLink {
+            return .openMeetingLink(meetingLink, runJoinScript: runJoinEventScript)
+        }
+
+        if let eventURL = event.eventURL {
+            return .openEventURL(eventURL)
+        }
+
+        return .notifyMissingLink(title: event.title)
+    }
+}

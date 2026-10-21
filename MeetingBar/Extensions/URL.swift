@@ -23,25 +23,36 @@ extension URL {
             configuration.activates = true
             configuration.addsToRecentItems = true
 
-            NSWorkspace.shared.open([self], withApplicationAt: URL(fileURLWithPath: browserPath), configuration: configuration) { app, error in
-                guard app != nil else {
-                    NSLog("Can't open \(self) in \(browserName): \(String(describing: error?.localizedDescription))")
-                    sendNotification("link_url_cant_open_title".loco(browserName), "link_url_cant_open_message".loco(browserName))
-                    self.openInDefaultBrowser()
-                    return
+            if browserPath.hasSuffix(".app") {
+                NSWorkspace.shared.open([self], withApplicationAt: URL(fileURLWithPath: browserPath), configuration: configuration) { app, _ in
+                    guard app != nil else {
+                        AppMessageCenter.shared.post(.browserUnavailable(name: browserName))
+                        self.openInDefaultBrowser()
+                        return
+                    }
                 }
-                NSLog("Opening \(self) in \(browserName)")
+            } else {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: browserPath)
+                process.arguments = [self.absoluteString]
+
+                do {
+                    try process.run()
+                } catch {
+                    AppMessageCenter.shared.post(.browserUnavailable(name: browserName))
+                    openInDefaultBrowser()
+                }
+                return
             }
+
         }
     }
 
     @discardableResult
     func openInDefaultBrowser() -> Bool {
         let result = NSWorkspace.shared.open(self)
-        if result {
-            NSLog("Opening \(self) in default browser")
-        } else {
-            NSLog("Can't open \(self) in default browser")
+        if !result {
+            AppMessageCenter.shared.post(.defaultBrowserUnavailable)
         }
         return result
     }
